@@ -126,6 +126,9 @@ else:
     _import_structure["brushnet"].extend(
         [
             "StableDiffusionBrushNetPipeline",
+            "StableDiffusionBrushNetInversionPipeline",
+            "StableDiffusionBrushNetAdaINInversionPipeline",
+            "StableDiffusionBrushNetAdaINInversionNoMaskPipeline",
         ]
     )
     _import_structure["controlnet"].extend(
@@ -369,6 +372,9 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
         )
         from .blip_diffusion import BlipDiffusionPipeline
         from .brushnet import StableDiffusionBrushNetPipeline
+        from .brushnet import StableDiffusionBrushNetInversionPipeline
+        from .brushnet import StableDiffusionBrushNetAdaINInversionPipeline
+        from .brushnet import StableDiffusionBrushNetAdaINInversionNoMaskPipeline
         from .controlnet import (
             BlipDiffusionControlNetPipeline,
             StableDiffusionControlNetImg2ImgPipeline,

@@ -178,7 +178,8 @@ class DDIMInversion:
         for i in tqdm(range(self.NUM_DDIM_STEPS)):
             t = self.inversion_scheduler.timesteps[len(self.inversion_scheduler.timesteps) - i - 1]
             noise_pred = self.get_noise_pred_single(latent, t, cond_embeddings, iter_cur=len(self.inversion_scheduler.timesteps) - i - 1)
-            latent = self.next_step(noise_pred, t, latent)
+            # latent = self.next_step(noise_pred, t, latent)
+            latent = self.scheduler.step(noise_pred, t, latent)["prev_sample"]
             all_latent.append(latent)
 
         return all_latent
@@ -193,7 +194,7 @@ class DDIMInversion:
         return ddim_latents
     
 
-class StableDiffusionBrushNetDDIMInversionPipeline(
+class StableDiffusionBrushNetInversionPipeline(
     DiffusionPipeline,
     StableDiffusionMixin,
     TextualInversionLoaderMixin,
@@ -252,6 +253,7 @@ class StableDiffusionBrushNetDDIMInversionPipeline(
         safety_checker: StableDiffusionSafetyChecker,
         feature_extractor: CLIPImageProcessor,
         image_encoder: CLIPVisionModelWithProjection = None,
+        inverse_scheduler: KarrasDiffusionSchedulers = None,
         requires_safety_checker: bool = True,
     ):
         super().__init__()
@@ -287,7 +289,7 @@ class StableDiffusionBrushNetDDIMInversionPipeline(
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor, do_convert_rgb=True)
         self.register_to_config(requires_safety_checker=requires_safety_checker)
         
-        self.inversion = DDIMInversion(scheduler=scheduler, unet=unet, text_encoder=text_encoder, tokenizer=tokenizer, device="cuda", NUM_DDIM_STEPS=50)
+        self.inversion = DDIMInversion(scheduler=inverse_scheduler, unet=unet, text_encoder=text_encoder, tokenizer=tokenizer, device="cuda", NUM_DDIM_STEPS=50)
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline._encode_prompt
     def _encode_prompt(
@@ -1183,7 +1185,18 @@ class StableDiffusionBrushNetDDIMInversionPipeline(
         # 6. Prepare latent variables
         inversion_img = image[:1]
         inversion_latent = self.vae.encode(inversion_img).latent_dist.sample() * self.vae.config.scaling_factor
-        inversion_latent = self.inversion.invert(ddim_latents=inversion_latent, prompt="")[-1]
+        inversion_latents = self.inversion.invert(ddim_latents=inversion_latent, prompt="")
+        # ##debug
+        # for idx, latents in enumerate(inversion_latents):
+        #     debug_image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False, generator=generator)[0]
+        #     do_denormalize = [True] * image.shape[0]
+        #     debug_image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
+        #     import os
+        #     os.makedirs('debug',exist_ok=True)
+        #     debug_image[0].save(f'debug/{idx}.png')
+        inversion_latent = inversion_latents[-1]
+        # noise = torch.randn_like(inversion_latent)
+        # noisy_inversion_latent = self.scheduler.add_noise(inversion_latent, noise, timesteps)[:1]
         num_channels_latents = self.unet.config.in_channels
         latents, noise = self.prepare_latents(
             batch_size * num_images_per_prompt,
@@ -1334,10 +1347,9 @@ class StableDiffusionBrushNetDDIMInversionPipeline(
             torch.cuda.empty_cache()
 
         if not output_type == "latent":
-            image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False, generator=generator)[
-                0
-            ]
-            image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
+            image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False, generator=generator)[0]
+            has_nsfw_concept = None
+            # image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
         else:
             image = latents
             has_nsfw_concept = None

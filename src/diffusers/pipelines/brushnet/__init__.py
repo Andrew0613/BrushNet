@@ -23,7 +23,9 @@ except OptionalDependencyNotAvailable:
     _dummy_objects.update(get_objects_from_module(dummy_torch_and_transformers_objects))
 else:
     _import_structure["pipeline_brushnet"] = ["StableDiffusionBrushNetPipeline"]
-
+    _import_structure["pipeline_brushnet_inversion"] = ["StableDiffusionBrushNetInversionPipeline"]
+    _import_structure["pipeline_brushnet_adain_inversion"] = ["StableDiffusionBrushNetAdaINInversionPipeline"]
+    _import_structure["pipeline_brushnet_adain_inversion_nomask"] = ["StableDiffusionBrushNetAdaINInversionNoMaskPipeline"]
 
 if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
     try:
@@ -34,6 +36,9 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
         from ...utils.dummy_torch_and_transformers_objects import *
     else:
         from .pipeline_brushnet import StableDiffusionBrushNetPipeline
+        from .pipeline_brushnet_inversion import StableDiffusionBrushNetInversionPipeline
+        from .pipeline_brushnet_adain_inversion import StableDiffusionBrushNetAdaINInversionPipeline
+        from .pipeline_brushnet_adain_inversion_nomask import StableDiffusionBrushNetAdaINInversionNoMaskPipeline
 
 else:
     import sys

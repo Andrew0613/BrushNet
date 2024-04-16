@@ -24,7 +24,7 @@ from ...utils.torch_utils import is_compiled_module, is_torch_version, randn_ten
 from ..pipeline_utils import DiffusionPipeline, StableDiffusionMixin
 from ..stable_diffusion.pipeline_output import StableDiffusionPipelineOutput
 from ..stable_diffusion.safety_checker import StableDiffusionSafetyChecker
-
+from tqdm import tqdm
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -124,8 +124,110 @@ def retrieve_timesteps(
         timesteps = scheduler.timesteps
     return timesteps, num_inference_steps
 
+def calc_mean_std(feat, mask=None, eps=1e-5):
+    size = feat.size()
+    assert len(size) == 4
+    N, C = size[:2]
 
-class StableDiffusionBrushNetPipeline(
+    if mask is not None:
+        # masked_feat = feat * mask.unsqueeze(1)  # 将feat与mask相乘
+        masked_feat = feat * mask
+        masked_count = mask.sum(dim=(2, 3)).unsqueeze(2).unsqueeze(3)  # 统计mask非零像素的数量
+
+        feat_mean = masked_feat.sum(dim=(2, 3)) / (masked_count + eps)  # 除以非零像素的数量得到均值
+        feat_mean = feat_mean.view(N, C, 1, 1)
+
+        feat_centered = (masked_feat - feat_mean.expand_as(masked_feat))  # 减去均值
+        feat_var = (feat_centered * feat_centered).sum(dim=(2, 3)) / (masked_count + eps)  # 计算方差
+        feat_std = feat_var.sqrt().view(N, C, 1, 1)
+    else:
+        feat_mean = feat.view(N, C, -1).mean(dim=2).view(N, C, 1, 1)
+        feat_var = feat.view(N, C, -1).var(dim=2, unbiased=False) + eps
+        feat_std = feat_var.sqrt().view(N, C, 1, 1)
+
+    return feat_mean, feat_std
+
+def adaptive_instance_normalization(content_feat, style_feat, mask):
+    assert (content_feat.size()[:2] == style_feat.size()[:2])
+    size = content_feat.size()
+    style_mean, style_std = calc_mean_std(style_feat, mask)
+    content_mean, content_std = calc_mean_std(content_feat)
+
+    normalized_feat = (content_feat - content_mean.expand(
+        size)) / content_std.expand(size)
+    return normalized_feat * style_std.expand(size) + style_mean.expand(size)
+
+class DDIMInversion:
+    def __init__(self, scheduler, unet, text_encoder, tokenizer, device, NUM_DDIM_STEPS):
+        self.inversion_scheduler = scheduler
+        self.unet = unet
+        self.text_encoder = text_encoder
+        self.tokenizer = tokenizer
+        self.device = device
+        self.inversion_scheduler.set_timesteps(NUM_DDIM_STEPS)
+        self.NUM_DDIM_STEPS = NUM_DDIM_STEPS
+        self.prompt = None
+    
+    def next_step(self, model_output: Union[torch.FloatTensor, np.ndarray], timestep: int, sample: Union[torch.FloatTensor, np.ndarray]):
+        timestep, next_timestep = min(timestep - self.inversion_scheduler.config.num_train_timesteps // self.inversion_scheduler.num_inference_steps, 999), timestep
+        alpha_prod_t = self.inversion_scheduler.alphas_cumprod[timestep] if timestep >= 0 else self.inversion_scheduler.final_alpha_cumprod
+        alpha_prod_t_next = self.inversion_scheduler.alphas_cumprod[next_timestep]
+        beta_prod_t = 1 - alpha_prod_t
+        next_original_sample = (sample - beta_prod_t ** 0.5 * model_output) / alpha_prod_t ** 0.5
+        next_sample_direction = (1 - alpha_prod_t_next) ** 0.5 * model_output
+        next_sample = alpha_prod_t_next ** 0.5 * next_original_sample + next_sample_direction
+        return next_sample
+    
+    def get_noise_pred_single(self, latents, t, context, iter_cur):
+        noise_pred = self.unet(latents, t, encoder_hidden_states=context)["sample"]
+        # noise_pred = self.unet(latents, t, encoder_hidden_states=context, iter_cur=iter_cur)["sample"]
+        return noise_pred
+
+    @torch.no_grad()
+    def init_prompt(self, prompt: str, emb_im=None):
+        if not isinstance(prompt, list):
+            prompt = [prompt]
+        text_input = self.tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=self.tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+        text_embeddings = self.text_encoder(text_input.input_ids.to(self.device))[0]
+        if emb_im is not None:
+            self.text_embeddings = torch.cat([text_embeddings, emb_im],dim=1)
+        else:
+            self.text_embeddings = text_embeddings
+
+        self.prompt = prompt
+
+    @torch.no_grad()
+    def ddim_loop(self, latent):
+        cond_embeddings = self.text_embeddings
+        all_latent = [latent]
+        latent = latent.clone().detach()
+        print('DDIM Inversion:')
+        for i in tqdm(range(self.NUM_DDIM_STEPS)):
+            t = self.inversion_scheduler.timesteps[len(self.inversion_scheduler.timesteps) - i - 1]
+            noise_pred = self.get_noise_pred_single(latent, t, cond_embeddings, iter_cur=len(self.inversion_scheduler.timesteps) - i - 1)
+            # latent = self.next_step(noise_pred, t, latent)
+            latent = self.scheduler.step(noise_pred, t, latent)["prev_sample"]
+            all_latent.append(latent)
+
+        return all_latent
+
+    @property
+    def scheduler(self):
+        return self.inversion_scheduler
+    
+    def invert(self, ddim_latents, prompt: str, emb_im=None):
+        self.init_prompt(prompt, emb_im=emb_im)
+        ddim_latents = self.ddim_loop(ddim_latents)
+        return ddim_latents
+    
+
+class StableDiffusionBrushNetAdaINInversionPipeline(
     DiffusionPipeline,
     StableDiffusionMixin,
     TextualInversionLoaderMixin,
@@ -184,6 +286,7 @@ class StableDiffusionBrushNetPipeline(
         safety_checker: StableDiffusionSafetyChecker,
         feature_extractor: CLIPImageProcessor,
         image_encoder: CLIPVisionModelWithProjection = None,
+        inverse_scheduler: KarrasDiffusionSchedulers = None,
         requires_safety_checker: bool = True,
     ):
         super().__init__()
@@ -218,6 +321,8 @@ class StableDiffusionBrushNetPipeline(
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor, do_convert_rgb=True)
         self.register_to_config(requires_safety_checker=requires_safety_checker)
+        
+        self.inversion = DDIMInversion(scheduler=inverse_scheduler, unet=unet, text_encoder=text_encoder, tokenizer=tokenizer, device="cuda", NUM_DDIM_STEPS=50)
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline._encode_prompt
     def _encode_prompt(
@@ -804,6 +909,11 @@ class StableDiffusionBrushNetPipeline(
         assert emb.shape == (w.shape[0], embedding_dim)
         return emb
 
+    def ddim_inv(self, latent, prompt, emb_im=None):
+        ddim_inv = DDIMInversion(model=self.pipe, NUM_DDIM_STEPS=self.NUM_DDIM_STEPS)
+        ddim_latents = ddim_inv.invert(ddim_latents=latent.unsqueeze(2), prompt=prompt, emb_im=emb_im)
+        return ddim_latents
+    
     @property
     def guidance_scale(self):
         return self._guidance_scale
@@ -1106,6 +1216,24 @@ class StableDiffusionBrushNetPipeline(
         self._num_timesteps = len(timesteps)
 
         # 6. Prepare latent variables
+        inversion_img = image[:1]
+        inversion_latent = self.vae.encode(inversion_img).latent_dist.sample() * self.vae.config.scaling_factor
+        inversion_latents = self.inversion.invert(ddim_latents=inversion_latent, prompt="")
+        # ##debug
+        # for idx, latents in enumerate(inversion_latents):
+        #     debug_image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False, generator=generator)[0]
+        #     do_denormalize = [True] * image.shape[0]
+        #     debug_image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
+        #     import os
+        #     os.makedirs('debug',exist_ok=True)
+        #     debug_image[0].save(f'debug/{idx}.png')
+        inversion_latent = inversion_latents[-1]
+        inversion_mask = original_mask[:1]
+        inversion_mask = torch.nn.functional.interpolate(
+            inversion_mask, size=(inversion_latent.shape[-2], inversion_latent.shape[-1])
+        )
+        # noise = torch.randn_like(inversion_latent)
+        # noisy_inversion_latent = self.scheduler.add_noise(inversion_latent, noise, timesteps)[:1]
         num_channels_latents = self.unet.config.in_channels
         latents, noise = self.prepare_latents(
             batch_size * num_images_per_prompt,
@@ -1117,7 +1245,7 @@ class StableDiffusionBrushNetPipeline(
             generator,
             latents,
         )
-
+        latents = adaptive_instance_normalization(content_feat=latents, style_feat=inversion_latent, mask=inversion_mask)
         # 6.1 prepare condition latents
         conditioning_latents=self.vae.encode(image).latent_dist.sample() * self.vae.config.scaling_factor
         mask = torch.nn.functional.interpolate(
@@ -1149,6 +1277,7 @@ class StableDiffusionBrushNetPipeline(
         )
 
         # 7.2 Create tensor stating which brushnets to keep
+        # 这一行是什么意思？
         brushnet_keep = []
         for i in range(len(timesteps)):
             keeps = [
@@ -1255,9 +1384,7 @@ class StableDiffusionBrushNetPipeline(
             torch.cuda.empty_cache()
 
         if not output_type == "latent":
-            image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False, generator=generator)[
-                0
-            ]
+            image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False, generator=generator)[0]
             has_nsfw_concept = None
             # image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
         else:
